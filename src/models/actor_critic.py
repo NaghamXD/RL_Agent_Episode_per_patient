@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-from .encoder import CNNEncoder3D
+from .encoder import CNNEncoder3D, orthogonal_init
 
 
 # Per-beamlet weight at init.  We want the *initial* policy to already
@@ -43,12 +43,13 @@ class ActorCritic(nn.Module):
                  log_std_max: float = ACTOR_LOG_STD_MAX):
         super().__init__()
         self.encoder = CNNEncoder3D(in_channels, latent_dim)
+        relu_gain = nn.init.calculate_gain("relu")
         # +1 for the scalar fraction_progress (fraction_index / n_fractions)
         # appended after the CNN encoder output.
         feature_dim = latent_dim + 1
         self.actor_trunk = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim), nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True),
+            orthogonal_init(nn.Linear(feature_dim, hidden_dim), relu_gain), nn.ReLU(inplace=False),
+            orthogonal_init(nn.Linear(hidden_dim, hidden_dim), relu_gain), nn.ReLU(inplace=False),
         )
         self.actor_mu = nn.Linear(hidden_dim, n_beamlets)
         # Initialize actor head small so initial mu ~ ACTOR_MU_BIAS_INIT.
@@ -62,10 +63,15 @@ class ActorCritic(nn.Module):
             torch.full((n_beamlets,), float(log_std_init))
         )
 
+        # Standard PPO orthogonal-init recipe (Engstrom et al. 2020;
+        # Stable-Baselines3 / CleanRL use the same scheme): gain=sqrt(2) on
+        # hidden layers feeding a ReLU, gain=1.0 on the unsquashed scalar
+        # value head (no shrinking needed -- unlike the policy mean head
+        # above, there's no saturation risk to guard against).
         self.critic = nn.Sequential(
-            nn.Linear(feature_dim, hidden_dim), nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
+            orthogonal_init(nn.Linear(feature_dim, hidden_dim), relu_gain), nn.ReLU(inplace=False),
+            orthogonal_init(nn.Linear(hidden_dim, hidden_dim), relu_gain), nn.ReLU(inplace=False),
+            orthogonal_init(nn.Linear(hidden_dim, 1), 1.0),
         )
 
     def features(self,

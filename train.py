@@ -25,6 +25,8 @@ from src.config import load_config
 from src.env.dose_env import DoseEnv
 from src.agents.ppo import PPO, Rollout
 from src.utils.metrics import dvh_score
+from src.utils.train_logger import TrainingLogger
+from src.utils.early_stopping import PlateauMonitor
 
 
 def _print_fraction(episode_index: int,
@@ -332,16 +334,30 @@ def main():
     initial_state, _initial_fraction_progress = env.reset()
     in_channels = initial_state.shape[0]
     agent = PPO(cfg, in_channels=in_channels)
+    print(f"[train] device = {agent.device} (cfg.device = '{cfg.device}')")
 
     Path(cfg.ckpt_dir).mkdir(parents=True, exist_ok=True)
 
     # ---------------------------------------------------------------- resume
+    # ``start_episode`` / ``best_val_dvh`` are read back from the checkpoint
+    # (absent on older checkpoints or warmstart.pt -> default to 0 / inf) so
+    # a resumed run continues the OAR-weight curriculum and the best.pt
+    # comparison from where the loaded policy actually is, instead of
+    # silently re-ramping lambda_oar from its low starting factor and
+    # risking best.pt being overwritten by a worse policy on the very next
+    # validation check.
+    start_episode = 0
+    best_val_dvh = float("inf")
     if args.resume is not None:
         resume_path = Path(args.resume)
         if not resume_path.is_file():
             raise SystemExit(f"--resume checkpoint not found: {resume_path}")
-        agent.load(str(resume_path))
-        print(f"[resume] loaded {resume_path}")
+        checkpoint = agent.load(str(resume_path))
+        start_episode = int(checkpoint.get("episode_index", -1)) + 1
+        best_val_dvh = float(checkpoint.get("best_val_dvh", float("inf")))
+        print(f"[resume] loaded {resume_path} "
+              f"(continuing from episode {start_episode}, "
+              f"best_val_dvh so far = {best_val_dvh:.3f})")
 
     # ---------------------------------------------------------------- warm-start
     do_warmstart = (
@@ -392,7 +408,6 @@ def main():
     recent_patient_rewards: deque[float] = deque(
         maxlen=max(int(cfg.best_rolling_window), 1)
     )
-    best_val_dvh = float("inf")
     best_rolling_mean_reward = -float("inf")
     eval_every_best = max(1, int(getattr(cfg, "best_eval_every", 25)))
 
@@ -409,7 +424,23 @@ def main():
                   "value_loss":  float("nan"),
                   "entropy":     float("nan")}
 
-    progress_bar = trange(cfg.total_episodes, desc="train")
+    # Persists the learning curve across the run (and across --resume, since
+    # it opens in append mode) so a gamma sweep or a plateau check has
+    # something to compare. See src/utils/train_logger.py.
+    logger = TrainingLogger(Path(cfg.ckpt_dir) / "train_log.csv")
+    # Diagnostic-only: logs a "[plateau]" message but never stops training
+    # (see src/utils/early_stopping.py for the rationale). Disabled by
+    # default (early_stop_patience_evals: 0); patience only starts counting
+    # once the OAR-weight curriculum has fully ramped, so the curriculum's
+    # own transient dip isn't misread as a plateau.
+    plateau_monitor = PlateauMonitor(
+        patience_evals=int(getattr(cfg, "early_stop_patience_evals", 0)),
+        min_delta=float(getattr(cfg, "early_stop_min_delta", 0.005)),
+        start_episode=int(getattr(cfg, "lambda_oar_ramp_episodes", 0) or 0),
+    )
+
+    end_episode = start_episode + cfg.total_episodes
+    progress_bar = trange(start_episode, end_episode, desc="train")
     for episode_index in progress_bar:
         # OAR-weight curriculum: ramp lambda_oar over the first
         # cfg.lambda_oar_ramp_episodes patients so PPO can learn to
@@ -429,7 +460,7 @@ def main():
         # on the final episode so nothing is left unflushed). ``last_value=0``
         # is the correct terminal bootstrap: the last fraction has done=True.
         rollout_buffer.append(rollout)
-        is_final_episode = (episode_index == cfg.total_episodes - 1)
+        is_final_episode = (episode_index == end_episode - 1)
         if len(rollout_buffer) >= batch_n_patients or is_final_episode:
             last_stats = agent.update_batch(rollout_buffer, last_value=0.0)
             rollout_buffer = []
@@ -461,8 +492,11 @@ def main():
         )
 
         # Periodic validation-DVH check for best.pt (primary criterion).
+        val_dvh_this_episode = None
+        is_new_best_this_episode = False
         if val_env is not None and (episode_index + 1) % eval_every_best == 0:
             val_dvh = _validation_dvh_score(agent, val_env, n_val_patients)
+            val_dvh_this_episode = val_dvh
             tqdm.write(
                 f"  [val ep {episode_index + 1}] "
                 f"mean DVH score on {n_val_patients} patient(s) = "
@@ -472,10 +506,21 @@ def main():
             )
             if np.isfinite(val_dvh) and val_dvh < best_val_dvh:
                 best_val_dvh = val_dvh
-                agent.save(os.path.join(cfg.ckpt_dir, "best.pt"))
+                is_new_best_this_episode = True
+                agent.save(os.path.join(cfg.ckpt_dir, "best.pt"),
+                          episode_index=episode_index, best_val_dvh=best_val_dvh)
                 tqdm.write(
                     f"  [val ep {episode_index + 1}] saved best.pt "
                     f"(DVH score {val_dvh:.3f})"
+                )
+            if np.isfinite(val_dvh) and plateau_monitor.update(episode_index, val_dvh):
+                tqdm.write(
+                    f"  [plateau] no >{plateau_monitor.min_delta * 100:.1f}% "
+                    f"relative improvement in val_dvh for "
+                    f"{plateau_monitor.patience_evals} validation check(s) "
+                    f"(best so far: {plateau_monitor.best_score:.3f}) "
+                    f"at episode {episode_index + 1} -- monitor only, "
+                    f"training continues."
                 )
 
         # Fallback rolling-mean criterion only when no validation env.
@@ -483,16 +528,32 @@ def main():
             rolling_mean = float(np.mean(recent_patient_rewards))
             if rolling_mean > best_rolling_mean_reward:
                 best_rolling_mean_reward = rolling_mean
-                agent.save(os.path.join(cfg.ckpt_dir, "best.pt"))
+                agent.save(os.path.join(cfg.ckpt_dir, "best.pt"),
+                          episode_index=episode_index)
 
         if (episode_index + 1) % cfg.eval_every == 0:
             agent.save(
-                os.path.join(cfg.ckpt_dir, f"ep{episode_index + 1}.pt")
+                os.path.join(cfg.ckpt_dir, f"ep{episode_index + 1}.pt"),
+                episode_index=episode_index, best_val_dvh=best_val_dvh,
             )
+
+        logger.log_episode(
+            episode_index,
+            patient_reward=float(patient_total_reward),
+            rolling_mean_reward=float(np.mean(recent_patient_rewards)),
+            policy_loss=float(stats["policy_loss"]),
+            value_loss=float(stats["value_loss"]),
+            entropy=float(stats["entropy"]),
+            lambda_oar_effective=float(env.lambda_oar),
+            val_dvh=val_dvh_this_episode,
+            is_new_best=is_new_best_this_episode,
+        )
 
     # Always keep a final checkpoint, even if total_episodes is not a
     # multiple of eval_every.
-    agent.save(os.path.join(cfg.ckpt_dir, "last.pt"))
+    last_episode_index = end_episode - 1
+    agent.save(os.path.join(cfg.ckpt_dir, "last.pt"),
+              episode_index=last_episode_index, best_val_dvh=best_val_dvh)
 
     # Final validation pass so the user sees the end-of-training DVH
     # score and so best.pt has a chance to be updated by the very last
@@ -504,9 +565,11 @@ def main():
               f"{n_val_patients} patient(s) = {final_val_dvh:.3f}")
         if np.isfinite(final_val_dvh) and final_val_dvh < best_val_dvh:
             best_val_dvh = final_val_dvh
-            agent.save(os.path.join(cfg.ckpt_dir, "best.pt"))
+            agent.save(os.path.join(cfg.ckpt_dir, "best.pt"),
+                      episode_index=last_episode_index, best_val_dvh=best_val_dvh)
             print(f"[final val] saved best.pt (DVH score {final_val_dvh:.3f})")
         print(f"[final val] best DVH score across run: {best_val_dvh:.3f}")
+    logger.close()
 
 
 if __name__ == "__main__":

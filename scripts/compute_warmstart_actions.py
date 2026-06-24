@@ -25,13 +25,29 @@ downsampling miss the rest). Per-PTV-voxel D95 is therefore bounded
 above by the *reachable* PTV mass, not by what the agent does. The
 warm-start gives a near-best plan within that DIM capacity.
 
+Note on splits
+--------------
+``train.py``'s ``_warmstart_actor`` only ever reads warm-start files from
+``cfg.train_split`` (train) -- validation/test warm-start actions are
+never read during training or best.pt selection, so computing them by
+default is pure wasted compute (a FISTA-NNLS solve per patient) with no
+effect on results. The only consumer of a non-train warm-start file is
+the optional ``--charts-patient`` diagnostic overlay in
+``evaluate.py``/``src/utils/visualize.py`` -- a single chart panel, not
+a metric. Defaults to train only; pass ``--splits validation`` /
+``--splits test`` explicitly if you want that chart available there too.
+
 Usage
 -----
 python scripts/compute_warmstart_actions.py --config configs/default.yaml
-    # by default: train + validation + test splits, skip patients already done
+    # by default: train split only, skip patients already done
 
 python scripts/compute_warmstart_actions.py --splits train --force
-    # recompute only the train split
+    # recompute the train split
+
+python scripts/compute_warmstart_actions.py --splits validation
+    # optional: also compute for validation, only needed for the
+    # --charts-patient warm-start overlay panel when evaluating on it
 """
 from __future__ import annotations
 import argparse
@@ -296,8 +312,11 @@ def main() -> None:
     arg_parser.add_argument("--config", default="configs/default.yaml")
     arg_parser.add_argument(
         "--splits", nargs="+",
-        default=["train", "validation", "test"],
-        help="processed sub-folders to scan",
+        default=["train"],
+        help="processed sub-folders to scan. Only 'train' is read by "
+             "train.py's warm-start pretraining; pass 'validation'/'test' "
+             "explicitly only if you want the optional --charts-patient "
+             "warm-start overlay panel in evaluate.py on those splits.",
     )
     arg_parser.add_argument(
         "--n-iter", type=int, default=400,

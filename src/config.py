@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict
 import yaml
+import torch
 
 
 # Fixed by OpenKBP (do NOT change)
@@ -110,7 +111,14 @@ class Config:
     total_episodes: int = 2000
     eval_every: int = 50
     seed: int = 42
-    device: str = "cuda"
+    # "auto" picks the best available accelerator (cuda > mps > cpu).
+    # Set explicitly ("cuda" / "mps" / "cpu") to force one; an unavailable
+    # explicit choice falls back to cpu with a printed warning. This
+    # dataclass default is just a fallback for a YAML that omits the key --
+    # configs/default.yaml pins "cpu" explicitly with the reasoning
+    # (a reproducible MPS NaN bug on this architecture); read that comment
+    # before relying on "auto"/"mps" on Apple Silicon.
+    device: str = "auto"
     ckpt_dir: str = "runs"
 
     # --- warm-start (supervised actor pretraining) ---
@@ -151,6 +159,14 @@ class Config:
     # Kept for back-compat / diagnostics; no longer drives best.pt.
     best_rolling_window: int = 10
 
+    # --- plateau monitor (diagnostic; never auto-stops training) ---
+    # Number of consecutive validation checks (each spaced best_eval_every
+    # episodes apart) with no >min_delta relative improvement in val_dvh
+    # before a "[plateau]" message is logged. 0 disables the monitor
+    # entirely (default off).
+    early_stop_patience_evals: int = 0
+    early_stop_min_delta: float = 0.005
+
     @property
     def n_beamlets(self) -> int:
         return self.n_beams * self.beamlet_h * self.beamlet_w
@@ -163,6 +179,39 @@ class Config:
     @property
     def n_voxels(self) -> int:
         return self.grid ** 3
+
+
+def resolve_device(requested: str = "auto") -> torch.device:
+    """Map ``cfg.device`` to an actually-available ``torch.device``.
+
+    ``"auto"`` picks the best available accelerator: CUDA, then Apple
+    Metal (MPS), then CPU. An explicit ``"cuda"`` / ``"mps"`` request
+    that isn't available on this machine falls back to CPU (with a
+    warning) rather than crashing.
+    """
+    requested = (requested or "auto").strip().lower()
+    mps_available = torch.backends.mps.is_available()
+
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if mps_available:
+            return torch.device("mps")
+        return torch.device("cpu")
+
+    if requested == "cuda":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        print("[device] cuda requested but not available; falling back to cpu")
+        return torch.device("cpu")
+
+    if requested == "mps":
+        if mps_available:
+            return torch.device("mps")
+        print("[device] mps requested but not available; falling back to cpu")
+        return torch.device("cpu")
+
+    return torch.device("cpu")
 
 
 def load_config(path: str | Path) -> Config:

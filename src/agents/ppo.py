@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..config import Config
+from ..config import Config, resolve_device
 from ..models.actor_critic import (ActorCritic, ACTION_SCALE,
                                    ACTOR_LOG_STD_INIT, ACTOR_LOG_STD_MAX)
 
@@ -42,7 +42,7 @@ class Rollout:
 class PPO:
     def __init__(self, cfg: Config, in_channels: int):
         self.cfg = cfg
-        self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+        self.device = resolve_device(cfg.device)
         self.net = ActorCritic(
             in_channels, cfg.n_beamlets,
             log_std_init=float(getattr(cfg, "actor_log_std_init",
@@ -362,9 +362,39 @@ class PPO:
                 "pretrain_n":         n_samples}
 
     # ------------------------------------------------------------ I/O
-    def save(self, path: str):
-        torch.save({"net": self.net.state_dict()}, path)
+    def save(self, path: str, *,
+            episode_index: int | None = None,
+            best_val_dvh: float | None = None) -> None:
+        """Save net + optimizer state, plus resume metadata when given.
 
-    def load(self, path: str):
+        ``episode_index`` / ``best_val_dvh`` are omitted for checkpoints
+        that aren't part of the main PPO loop (e.g. ``warmstart.pt``), so
+        loading them later correctly starts the curriculum/best-score
+        tracking from scratch rather than from a meaningless episode 0
+        written in error.
+        """
+        payload = {"net": self.net.state_dict(),
+                   "optimizer": self.opt.state_dict()}
+        if episode_index is not None:
+            payload["episode_index"] = int(episode_index)
+        if best_val_dvh is not None:
+            payload["best_val_dvh"] = float(best_val_dvh)
+        torch.save(payload, path)
+
+    def load(self, path: str) -> dict:
+        """Load net (+ optimizer state, if present) and return the raw
+        checkpoint dict so callers can read ``episode_index`` /
+        ``best_val_dvh`` for a resume-safe continuation. Both keys are
+        absent on checkpoints saved before this metadata existed, so
+        callers should use ``.get(..., default)``.
+        """
         checkpoint = torch.load(path, map_location=self.device)
         self.net.load_state_dict(checkpoint["net"])
+        if "optimizer" in checkpoint:
+            try:
+                self.opt.load_state_dict(checkpoint["optimizer"])
+            except (ValueError, RuntimeError, KeyError):
+                # Shape mismatch against an older checkpoint format; fall
+                # back to fresh Adam moments rather than failing the load.
+                pass
+        return checkpoint

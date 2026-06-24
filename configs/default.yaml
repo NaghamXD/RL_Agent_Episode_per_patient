@@ -108,7 +108,15 @@ minibatch:       64
 total_episodes:  3500
 eval_every:      50
 seed:            42
-device:          cuda           # falls back to cpu automatically
+# "auto" picks cuda > mps > cpu, but is pinned to "cpu" here: on this
+# project's 3D-CNN (Conv3d-heavy, no normalization layers) the orthogonal
+# weight init (see src/models/encoder.py / actor_critic.py) reliably NaNs
+# real supervised warm-start training on Apple's MPS backend within one
+# epoch (escalating gradient norms -> NaN), confirmed reproducible across
+# 7+ trials and independent of the (separately real, separately fixed)
+# inplace=True ReLU bug. CPU is fully stable under identical math, just
+# slower. Re-test before switching back to "mps"/"auto" on this box.
+device:          cpu
 ckpt_dir:        runs
 
 # --- warm-start (supervised actor pretraining) ---
@@ -139,10 +147,15 @@ lambda_oar_ramp_start_factor: 0.10
 # best_n_val_patients of cfg.eval_split, evaluated deterministically
 # every best_eval_every patients during PPO training. The legacy
 # training-reward rolling mean is kept as a diagnostic only.
-# Iteration-2: bump n_val_patients 3 -> 6. With only 3 patients the
+# Iteration-2: bumped n_val_patients 3 -> 6. With only 3 patients the
 # previous best.pt scored 25.1 but the true 40-patient mean was 27.95,
 # i.e. the selection criterion was noisy enough to lock in an early
 # post-warm-start checkpoint before PPO had time to refine.
-best_n_val_patients: 6
+# Iteration-3: bumped 6 -> 40 (the whole validation split). 6 patients
+# still sampled a subset of the same 40-patient pool the Iteration-2 note
+# flagged as noisy -- using all of them removes that sampling noise
+# entirely instead of just reducing it. Costs ~6.7x more eval time per
+# check (still small relative to a full training run).
+best_n_val_patients: 40
 best_eval_every:     25
 best_rolling_window: 10

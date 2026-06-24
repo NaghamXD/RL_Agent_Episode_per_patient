@@ -338,6 +338,7 @@ def main():
           f"ckpt = {args.ckpt}")
     initial_state, _initial_fraction_progress = env.reset()
     agent = PPO(cfg, in_channels=initial_state.shape[0])
+    print(f"[evaluate] device = {agent.device} (cfg.device = '{cfg.device}')")
     agent.load(args.ckpt)
     agent.net.eval()
 

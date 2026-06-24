@@ -77,7 +77,8 @@ def init_backend(config_path: str = "configs/default.yaml",
         in_channels = 12
         AGENT = PPO(CONFIG, in_channels=in_channels)
         
-        device = torch.device(CONFIG.device if torch.cuda.is_available() else "cpu")
+        from src.config import resolve_device
+        device = resolve_device(CONFIG.device)
         checkpoint = torch.load(ckpt_path, map_location=device)
         AGENT.net.load_state_dict(checkpoint['net'])
         AGENT.net.eval()

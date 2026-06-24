@@ -164,7 +164,8 @@ python train.py --config configs/default.yaml
 
 # 6) evaluate the best checkpoint on the eval split (validation by default)
 python evaluate.py --config configs/default.yaml --ckpt runs/best.pt
-#   override the split if you want, e.g. final test:
+#   only override to --split test for a final, one-time holdout report --
+#   test must stay untouched by any tuning/model-selection decision:
 # python evaluate.py --config configs/default.yaml --ckpt runs/best.pt --split test
 ```
 
