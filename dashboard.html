@@ -167,6 +167,11 @@
             <div id="splitInfo" style="font-size:11px;color:var(--muted);margin-top:8px"></div>
         </div>
         <div class="sidebar-section">
+            <h3>Model Checkpoint</h3>
+            <select id="ckptSelect"><option>Loading...</option></select>
+            <div id="ckptInfo" style="font-size:11px;color:var(--muted);margin-top:8px"></div>
+        </div>
+        <div class="sidebar-section">
             <h3>Patient Selection</h3>
             <div class="patient-select-wrap">
                 <div class="select-row">
@@ -278,13 +283,14 @@
 
 <script>
 const API = 'http://localhost:5000/api';
-let config = null, simData = null, fracIdx = 0, activeSplit = null;
+let config = null, simData = null, fracIdx = 0, activeSplit = null, activeCkpt = null;
 
 const $ = id => document.getElementById(id);
 const patientSelect = $('patientSelect'), randomBtn = $('randomBtn'),
       simulateBtn = $('simulateBtn'), prevBtn = $('prevBtn'),
       nextBtn = $('nextBtn'), summaryBtn = $('summaryBtn'),
       backToFracBtn = $('backToFracBtn'), splitSelect = $('splitSelect'),
+      ckptSelect = $('ckptSelect'),
       fracJump = $('fracJump'), hideTerminal = $('hideTerminal');
 
 const PTV_COLORS = { PTV70:'#4f8ef7', PTV63:'#a78bfa', PTV56:'#34d399' };
@@ -661,6 +667,57 @@ async function loadSplits() {
     }
 }
 
+// Human-readable label for a checkpoint option (best.pt is flagged).
+function ckptLabel(c) {
+    const size = c.size_mb != null ? ` · ${c.size_mb} MB` : '';
+    return c.is_best ? `${c.name} ⭐ (best)${size}` : `${c.name}${size}`;
+}
+
+async function loadCheckpoints() {
+    try {
+        const r = await fetch(`${API}/checkpoints`);
+        if(!r.ok) throw new Error();
+        const d = await r.json();
+        const ckpts = d.checkpoints || [];
+        // Match the active checkpoint by basename (backend reports a full path).
+        const activeName = d.active ? d.active.split('/').pop() : null;
+        activeCkpt = activeName;
+        if(!ckpts.length) {
+            ckptSelect.innerHTML = '<option value="">No checkpoints found</option>';
+            $('ckptInfo').textContent = 'No .pt files in the runs folder.';
+            return;
+        }
+        ckptSelect.innerHTML = ckpts.map(c=>`<option value="${c.name}" ${c.name===activeName?'selected':''}>${ckptLabel(c)}</option>`).join('');
+        $('ckptInfo').textContent = `${ckpts.length} checkpoint${ckpts.length>1?'s':''} · ${d.agent_loaded?'loaded':'not loaded'}`;
+    } catch(e) {
+        // Backend has no checkpoint info (older build / demo) — leave a default.
+        ckptSelect.innerHTML = '<option value="best.pt">best.pt</option>';
+        activeCkpt = 'best.pt';
+        $('ckptInfo').textContent = '';
+    }
+}
+
+async function switchCheckpoint() {
+    const ckpt = ckptSelect.value;
+    if (!ckpt || ckpt === activeCkpt) return;
+    showLoading('Loading checkpoint...', `Switching the agent to ${ckpt}`);
+    try {
+        const r = await fetch(`${API}/checkpoint`, {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({checkpoint: ckpt}),
+        });
+        if(!r.ok) { const b=await r.json().catch(()=>({})); throw new Error(b.error||`HTTP ${r.status}`); }
+        const d = await r.json();
+        activeCkpt = d.checkpoint || ckpt;
+        $('ckptInfo').textContent = `Active: ${activeCkpt} · ${d.agent_loaded?'loaded':'not loaded'}`;
+        // The agent changed — drop any stale simulation and reset.
+        simData = null; showWelcome();
+    } catch(e) {
+        showError(`Could not load checkpoint: ${e.message}`);
+        ckptSelect.value = activeCkpt;   // revert the dropdown
+    } finally { hideLoading(); }
+}
+
 async function loadInitialData() {
     showLoading('Connecting to backend...','Loading config, splits and patient list');
     try {
@@ -669,6 +726,7 @@ async function loadInitialData() {
         if(!ptRes.ok)  throw new Error(`Patients: ${ptRes.status}`);
         config = await cfgRes.json();
         await loadSplits();
+        await loadCheckpoints();
         fillPatients(await ptRes.json());
         setStatus(true);
     } catch(e) {
@@ -740,6 +798,7 @@ simulateBtn.addEventListener('click', runSimulation);
 prevBtn.addEventListener('click', ()=>{ if(fracIdx>0){fracIdx--;renderFraction();} });
 nextBtn.addEventListener('click', ()=>{ if(simData&&fracIdx<simData.fractions.length-1){fracIdx++;renderFraction();} });
 splitSelect.addEventListener('change', switchSplit);
+ckptSelect.addEventListener('change', switchCheckpoint);
 fracJump.addEventListener('change', ()=>jumpTo((parseInt(fracJump.value,10)||1)-1));
 fracJump.addEventListener('keydown', e=>{ if(e.key==='Enter') jumpTo((parseInt(fracJump.value,10)||1)-1); });
 hideTerminal.addEventListener('change', ()=>{ if(simData) drawRewardDecomp(); });

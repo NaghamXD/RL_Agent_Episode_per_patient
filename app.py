@@ -313,6 +313,126 @@ def set_split():
         return jsonify({'error': str(e)}), 400
 
 
+def _runs_dir():
+    """Directory the checkpoints live in (parent of the active checkpoint).
+
+    Falls back to ``runs`` so the UI still has somewhere to look when no
+    checkpoint was ever loaded (e.g. demo mode).
+    """
+    if CKPT_PATH:
+        parent = Path(CKPT_PATH).parent
+        if str(parent):
+            return parent
+    return Path("runs")
+
+
+def _available_checkpoints():
+    """List the ``.pt`` checkpoints in the runs folder.
+
+    Returns a list of ``{name, path, is_best, mtime, size_mb}`` dicts sorted
+    with ``best.pt`` first, then the rest by name. The UI uses this to populate
+    the checkpoint dropdown so the user can pick best.pt or any intermediate
+    episode checkpoint without restarting the server.
+    """
+    runs = _runs_dir()
+    if not runs.is_dir():
+        return []
+    out = []
+    for p in sorted(runs.glob("*.pt")):
+        try:
+            stat = p.stat()
+            mtime, size = stat.st_mtime, stat.st_size
+        except OSError:
+            mtime, size = None, None
+        out.append({
+            'name': p.name,
+            'path': str(p).replace('\\', '/'),
+            'is_best': p.name == 'best.pt',
+            'mtime': mtime,
+            'size_mb': round(size / (1024 * 1024), 2) if size is not None else None,
+        })
+    # best.pt first, everything else alphabetical.
+    out.sort(key=lambda c: (not c['is_best'], c['name']))
+    return out
+
+
+@app.route('/api/checkpoints', methods=['GET'])
+def get_checkpoints():
+    """List the checkpoints available in the runs folder and the active one."""
+    _sync_agent_with_disk()
+    active = str(Path(CKPT_PATH)).replace('\\', '/') if CKPT_PATH else None
+    return jsonify({
+        'checkpoints': _available_checkpoints(),
+        'active': active,
+        'agent_loaded': AGENT is not None,
+    })
+
+
+@app.route('/api/checkpoint', methods=['POST'])
+def set_checkpoint():
+    """Switch the active checkpoint the agent is loaded from.
+
+    The UI sends ``{"checkpoint": "<name-or-path>"}``. The value may be a bare
+    filename (resolved inside the runs folder) or a full path; either way it
+    must point at a ``.pt`` file inside the runs folder — paths outside it are
+    rejected so the endpoint can't be used to load arbitrary files. On success
+    the agent is reloaded immediately and the new state is reported.
+    """
+    global CKPT_PATH
+    data = request.get_json(silent=True) or {}
+    requested = data.get('checkpoint')
+    if not requested:
+        return jsonify({'error': 'No checkpoint specified.'}), 400
+
+    runs = _runs_dir().resolve()
+    # Accept either a bare filename or a path; collapse to a name inside runs.
+    candidate = Path(requested)
+    target = (runs / candidate.name).resolve()
+
+    if target.parent != runs:
+        return jsonify({'error': 'Checkpoint must live in the runs folder.'}), 400
+    if target.suffix != '.pt' or not target.exists():
+        return jsonify({
+            'error': f"Checkpoint '{candidate.name}' not found in the runs folder.",
+            'available': [c['name'] for c in _available_checkpoints()],
+        }), 404
+
+    if not (MODELS_AVAILABLE and TORCH_AVAILABLE and CONFIG is not None):
+        # Demo mode: no real agent to load, just remember the selection.
+        CKPT_PATH = str(target).replace('\\', '/')
+        return jsonify({
+            'checkpoint': Path(CKPT_PATH).name,
+            'path': CKPT_PATH,
+            'agent_loaded': False,
+            'mode': 'demo',
+        })
+
+    previous = CKPT_PATH
+    CKPT_PATH = str(target).replace('\\', '/')
+    try:
+        _load_agent(CKPT_PATH)
+    except Exception as e:
+        print(f"Failed to load checkpoint '{CKPT_PATH}': {e}")
+        traceback.print_exc()
+        CKPT_PATH = previous  # roll back so the app keeps a known-good agent
+        _sync_agent_with_disk()
+        return jsonify({'error': f'Failed to load checkpoint: {e}'}), 400
+
+    if AGENT is None:
+        return jsonify({
+            'error': f"Checkpoint '{Path(CKPT_PATH).name}' could not be loaded into an agent.",
+            'checkpoint': Path(CKPT_PATH).name,
+            'agent_loaded': False,
+        }), 400
+
+    return jsonify({
+        'checkpoint': Path(CKPT_PATH).name,
+        'path': CKPT_PATH,
+        'agent_loaded': True,
+        'mode': 'live',
+    })
+
+
 @app.route('/api/patients/<patient_id>/data', methods=['GET'])
 def get_patient_data(patient_id):
     """Get patient anatomy and dose influence matrix info."""
