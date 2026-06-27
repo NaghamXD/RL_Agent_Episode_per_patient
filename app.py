@@ -43,14 +43,80 @@ AGENT = None
 BACKEND_READY = False
 PATIENT_CACHE = {}
 EVAL_RESULTS = {}
+# Path to the checkpoint the agent is loaded from, plus the file mtime it was
+# loaded at. These let us reconcile the in-memory agent with the file actually
+# present in the runs folder on every request (see _sync_agent_with_disk).
+CKPT_PATH = None
+CKPT_MTIME = None
+# The processed-data split (train / validation / test) the env is currently
+# bound to. The UI can switch this at runtime via POST /api/split.
+ACTIVE_SPLIT = None
+
+
+def _load_agent(ckpt_path):
+    """Load the PPO agent from a checkpoint file on disk.
+
+    Sets the module-level AGENT and records the file's mtime. When the file is
+    absent (or the models/torch are unavailable), AGENT is set to None so the
+    rest of the app falls back to the explicit "agent-unavailable" refusal
+    instead of serving a stale, in-memory model.
+    """
+    global AGENT, CKPT_MTIME
+    path = Path(ckpt_path)
+    if not (MODELS_AVAILABLE and TORCH_AVAILABLE and CONFIG is not None):
+        AGENT, CKPT_MTIME = None, None
+        return None
+    if not path.exists():
+        AGENT, CKPT_MTIME = None, None
+        return None
+    from src.config import resolve_device
+    device = resolve_device(CONFIG.device)
+    # in_channels = CT(1) + structures(3+5) + cumulative_dose(1) + ptv_gap(1) + beam_paths(1) = 12
+    in_channels = 12
+    agent = PPO(CONFIG, in_channels=in_channels)
+    checkpoint = torch.load(str(path), map_location=device)
+    agent.net.load_state_dict(checkpoint['net'])
+    agent.net.eval()
+    AGENT = agent
+    CKPT_MTIME = path.stat().st_mtime
+    return agent
+
+
+def _sync_agent_with_disk():
+    """Re-bind AGENT to whatever checkpoint is in the runs folder *right now*.
+
+    The Flask process keeps the agent in memory for its whole lifetime, so a
+    checkpoint deleted or retrained after startup would otherwise be ignored.
+    Called on every simulation request: drop the agent if its file is gone,
+    reload it if the file changed on disk. This guarantees the UI only ever
+    reflects the current contents of the runs folder, never a stale RAM copy.
+    """
+    global AGENT, CKPT_MTIME
+    if CKPT_PATH is None or CONFIG is None:
+        return
+    path = Path(CKPT_PATH)
+    if not path.exists():
+        if AGENT is not None:
+            print(f"Checkpoint '{CKPT_PATH}' is gone from disk; dropping in-memory agent.")
+            AGENT, CKPT_MTIME = None, None
+        return
+    mtime = path.stat().st_mtime
+    if AGENT is None or mtime != CKPT_MTIME:
+        try:
+            print(f"(Re)loading agent from '{CKPT_PATH}' (new or changed on disk).")
+            _load_agent(CKPT_PATH)
+        except Exception as e:
+            print(f"Failed to (re)load agent from '{CKPT_PATH}': {e}")
+            AGENT, CKPT_MTIME = None, None
 
 
 def init_backend(config_path: str = "configs/default.yaml", 
                  ckpt_path: str = "runs/best.pt",
                  split: str = "validation"):
     """Initialize backend with config, environment, and agent."""
-    global CONFIG, ENV, AGENT, BACKEND_READY
-    
+    global CONFIG, ENV, AGENT, BACKEND_READY, CKPT_PATH, ACTIVE_SPLIT
+
+    ACTIVE_SPLIT = split
     try:
         if not MODELS_AVAILABLE:
             print("ERROR: RL models not available, using demo mode")
@@ -70,21 +136,20 @@ def init_backend(config_path: str = "configs/default.yaml",
         
         CONFIG = load_config(config_path)
         ENV = DoseEnv(CONFIG, split=split)
-        
-        # Load pretrained agent
-        # PPO.__init__ takes (cfg, in_channels)
-        # in_channels = CT(1) + structures(3+5) + cumulative_dose(1) + ptv_gap(1) + beam_paths(1) = 12
-        in_channels = 12
-        AGENT = PPO(CONFIG, in_channels=in_channels)
-        
-        from src.config import resolve_device
-        device = resolve_device(CONFIG.device)
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        AGENT.net.load_state_dict(checkpoint['net'])
-        AGENT.net.eval()
-        
+        CKPT_PATH = ckpt_path
+
+        # Load the trained agent from disk. A missing checkpoint is handled
+        # gracefully (AGENT stays None) rather than raising, so the backend
+        # comes up in a well-defined "agent-unavailable" state. The agent is
+        # re-reconciled with the runs folder on every request afterwards.
+        _load_agent(ckpt_path)
+
         BACKEND_READY = True
-        print("✓ Backend initialized successfully")
+        if AGENT is not None:
+            print("✓ Backend initialized successfully")
+        else:
+            print(f"⚠ Backend ready, but no usable checkpoint at '{ckpt_path}'. "
+                  "Agent unavailable until a checkpoint is present in the runs folder.")
         return CONFIG, ENV, AGENT
     except Exception as e:
         print(f"ERROR initializing backend: {e}")
@@ -96,11 +161,17 @@ def init_backend(config_path: str = "configs/default.yaml",
 @app.route('/api/health', methods=['GET'])
 def health():
     """Health check endpoint."""
+    # Reconcile with disk so the reported agent state is the truth right now,
+    # not whatever was loaded at startup.
+    _sync_agent_with_disk()
     return jsonify({
-        'status': 'ok', 
+        'status': 'ok',
         'timestamp': datetime.now().isoformat(),
         'backend_ready': BACKEND_READY,
-        'models_available': MODELS_AVAILABLE
+        'models_available': MODELS_AVAILABLE,
+        'agent_loaded': AGENT is not None,
+        'checkpoint_path': CKPT_PATH,
+        'checkpoint_present': bool(CKPT_PATH and Path(CKPT_PATH).exists()),
     })
 
 
@@ -160,6 +231,206 @@ def get_patients():
             'mode': 'demo',
             'error': str(e)
         })
+
+
+_DEFAULT_SPLITS = ["train", "validation", "test"]
+
+
+def _available_splits():
+    """Processed-data splits present on disk (subfolders that hold patients).
+
+    Falls back to the conventional ``train/validation/test`` names when the
+    real config / processed dir isn't available (e.g. demo mode), so the UI
+    always has something to offer.
+    """
+    if CONFIG is None or not MODELS_AVAILABLE:
+        return list(_DEFAULT_SPLITS)
+    try:
+        processed_dir = Path(CONFIG.processed_dir)
+    except Exception:
+        return list(_DEFAULT_SPLITS)
+    if not processed_dir.is_dir():
+        return list(_DEFAULT_SPLITS)
+    splits = []
+    for child in sorted(processed_dir.iterdir()):
+        # A split folder is a directory that itself contains patient folders.
+        if child.is_dir() and any(p.is_dir() for p in child.iterdir()):
+            splits.append(child.name)
+    return splits or list(_DEFAULT_SPLITS)
+
+
+@app.route('/api/splits', methods=['GET'])
+def get_splits():
+    """List the available dataset splits and which one is active."""
+    return jsonify({
+        'splits': _available_splits(),
+        'active': ACTIVE_SPLIT,
+    })
+
+
+@app.route('/api/split', methods=['POST'])
+def set_split():
+    """Switch the active dataset split (train / validation / test).
+
+    Rebuilds ENV against the requested split's patient folder and returns the
+    new patient list so the UI can repopulate its dropdown. The agent and
+    config are untouched — only the pool of patients the env draws from.
+    """
+    global ENV, ACTIVE_SPLIT, PATIENT_CACHE
+    data = request.get_json(silent=True) or {}
+    split = data.get('split')
+    available = _available_splits()
+    if split not in available:
+        return jsonify({
+            'error': f"Unknown split '{split}'. Available: {available}",
+        }), 400
+
+    if not (MODELS_AVAILABLE and CONFIG is not None):
+        # Demo mode: no real env to rebuild, just remember the choice.
+        ACTIVE_SPLIT = split
+        demo_patients = [f"pt_{200+i}" for i in range(20)]
+        return jsonify({
+            'split': split,
+            'patients': demo_patients,
+            'total_count': len(demo_patients),
+            'mode': 'demo',
+        })
+
+    try:
+        ENV = DoseEnv(CONFIG, split=split)
+        ACTIVE_SPLIT = split
+        PATIENT_CACHE = {}
+        patients = sorted(ENV.patient_ids)
+        return jsonify({
+            'split': split,
+            'patients': patients,
+            'total_count': len(patients),
+            'mode': 'live',
+        })
+    except Exception as e:
+        print(f"Error switching split to '{split}': {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 400
+
+
+def _runs_dir():
+    """Directory the checkpoints live in (parent of the active checkpoint).
+
+    Falls back to ``runs`` so the UI still has somewhere to look when no
+    checkpoint was ever loaded (e.g. demo mode).
+    """
+    if CKPT_PATH:
+        parent = Path(CKPT_PATH).parent
+        if str(parent):
+            return parent
+    return Path("runs")
+
+
+def _available_checkpoints():
+    """List the ``.pt`` checkpoints in the runs folder.
+
+    Returns a list of ``{name, path, is_best, mtime, size_mb}`` dicts sorted
+    with ``best.pt`` first, then the rest by name. The UI uses this to populate
+    the checkpoint dropdown so the user can pick best.pt or any intermediate
+    episode checkpoint without restarting the server.
+    """
+    runs = _runs_dir()
+    if not runs.is_dir():
+        return []
+    out = []
+    for p in sorted(runs.glob("*.pt")):
+        try:
+            stat = p.stat()
+            mtime, size = stat.st_mtime, stat.st_size
+        except OSError:
+            mtime, size = None, None
+        out.append({
+            'name': p.name,
+            'path': str(p).replace('\\', '/'),
+            'is_best': p.name == 'best.pt',
+            'mtime': mtime,
+            'size_mb': round(size / (1024 * 1024), 2) if size is not None else None,
+        })
+    # best.pt first, everything else alphabetical.
+    out.sort(key=lambda c: (not c['is_best'], c['name']))
+    return out
+
+
+@app.route('/api/checkpoints', methods=['GET'])
+def get_checkpoints():
+    """List the checkpoints available in the runs folder and the active one."""
+    _sync_agent_with_disk()
+    active = str(Path(CKPT_PATH)).replace('\\', '/') if CKPT_PATH else None
+    return jsonify({
+        'checkpoints': _available_checkpoints(),
+        'active': active,
+        'agent_loaded': AGENT is not None,
+    })
+
+
+@app.route('/api/checkpoint', methods=['POST'])
+def set_checkpoint():
+    """Switch the active checkpoint the agent is loaded from.
+
+    The UI sends ``{"checkpoint": "<name-or-path>"}``. The value may be a bare
+    filename (resolved inside the runs folder) or a full path; either way it
+    must point at a ``.pt`` file inside the runs folder — paths outside it are
+    rejected so the endpoint can't be used to load arbitrary files. On success
+    the agent is reloaded immediately and the new state is reported.
+    """
+    global CKPT_PATH
+    data = request.get_json(silent=True) or {}
+    requested = data.get('checkpoint')
+    if not requested:
+        return jsonify({'error': 'No checkpoint specified.'}), 400
+
+    runs = _runs_dir().resolve()
+    # Accept either a bare filename or a path; collapse to a name inside runs.
+    candidate = Path(requested)
+    target = (runs / candidate.name).resolve()
+
+    if target.parent != runs:
+        return jsonify({'error': 'Checkpoint must live in the runs folder.'}), 400
+    if target.suffix != '.pt' or not target.exists():
+        return jsonify({
+            'error': f"Checkpoint '{candidate.name}' not found in the runs folder.",
+            'available': [c['name'] for c in _available_checkpoints()],
+        }), 404
+
+    if not (MODELS_AVAILABLE and TORCH_AVAILABLE and CONFIG is not None):
+        # Demo mode: no real agent to load, just remember the selection.
+        CKPT_PATH = str(target).replace('\\', '/')
+        return jsonify({
+            'checkpoint': Path(CKPT_PATH).name,
+            'path': CKPT_PATH,
+            'agent_loaded': False,
+            'mode': 'demo',
+        })
+
+    previous = CKPT_PATH
+    CKPT_PATH = str(target).replace('\\', '/')
+    try:
+        _load_agent(CKPT_PATH)
+    except Exception as e:
+        print(f"Failed to load checkpoint '{CKPT_PATH}': {e}")
+        traceback.print_exc()
+        CKPT_PATH = previous  # roll back so the app keeps a known-good agent
+        _sync_agent_with_disk()
+        return jsonify({'error': f'Failed to load checkpoint: {e}'}), 400
+
+    if AGENT is None:
+        return jsonify({
+            'error': f"Checkpoint '{Path(CKPT_PATH).name}' could not be loaded into an agent.",
+            'checkpoint': Path(CKPT_PATH).name,
+            'agent_loaded': False,
+        }), 400
+
+    return jsonify({
+        'checkpoint': Path(CKPT_PATH).name,
+        'path': CKPT_PATH,
+        'agent_loaded': True,
+        'mode': 'live',
+    })
 
 
 @app.route('/api/patients/<patient_id>/data', methods=['GET'])
@@ -338,6 +609,12 @@ def _dvh_demo(cumulative_organ_doses, prescriptions,
 def simulate_patient(patient_id):
     """Run agent simulation on a patient for all fractions."""
     try:
+        # Reconcile the agent with the checkpoint on disk *before* simulating,
+        # so we never serve a model that has since been removed from or replaced
+        # in the runs folder. If the file is gone, AGENT becomes None and the
+        # live path below refuses with a 503 rather than using a stale RAM copy.
+        _sync_agent_with_disk()
+
         prescriptions = CONFIG.prescription if CONFIG else {"PTV70": 70.0, "PTV63": 63.0, "PTV56": 56.0}
         tolerances = CONFIG.oar_tolerance if CONFIG else {
             "Brainstem": 54.0, "SpinalCord": 45.0, "Mandible": 70.0,
@@ -386,7 +663,16 @@ def simulate_patient(patient_id):
                     'ptv_d95': ptv_d95_frac,
                     'lambda_oar': lambda_oar,
                     'lambda_ptv': lambda_ptv,
+                    # Synthetic reward decomposition for demo mode (labelled as
+                    # demo in the UI). terminal is filled in on the last frac.
+                    'shaping_ptv': float(lambda_ptv * (0.02 + 0.001 * i)),
+                    'shaping_oar': float(-lambda_oar * max(0, 0.08 - i * 0.001)),
+                    'terminal_reward': 0.0,
+                    'dvh_score': None,
                 })
+            # The whole-course grade lands on the final fraction only.
+            fraction_data[-1]['terminal_reward'] = float(lambda_ptv * 0.9 - 0.25)
+            fraction_data[-1]['dvh_score'] = 26.0
             # Demo mode: all structures are synthetic and therefore present.
             present_structures = None
             dvh = _dvh_demo(fraction_data[-1]['cumulative_organ_doses'],
@@ -404,6 +690,8 @@ def simulate_patient(patient_id):
                     present_structures,
                     list(prescriptions.keys()), list(tolerances.keys()),
                 ),
+                'sequential': True,
+                'split': ACTIVE_SPLIT,
                 'mode': 'demo',
             })
 
@@ -464,6 +752,14 @@ def simulate_patient(patient_id):
                 'ptv_d95': dict(fraction_ptv_d95),
                 'lambda_oar': float(info.get('lambda_oar', lambda_oar)),
                 'lambda_ptv': float(info.get('lambda_ptv', lambda_ptv)),
+                # Real reward decomposition (sequential mode). shaping_ptv +
+                # shaping_oar + terminal_reward == reward exactly. terminal is
+                # 0 except on the final fraction; dvh_score only set there.
+                'shaping_ptv': float(info.get('shaping_ptv', 0.0)),
+                'shaping_oar': float(info.get('shaping_oar', 0.0)),
+                'terminal_reward': float(info.get('terminal_reward', 0.0)),
+                'dvh_score': (float(info['dvh_score'])
+                              if info.get('dvh_score') is not None else None),
             })
             fraction_idx += 1
 
@@ -487,6 +783,8 @@ def simulate_patient(patient_id):
                 present_structures,
                 list(prescriptions.keys()), list(tolerances.keys()),
             ),
+            'sequential': bool(getattr(CONFIG, 'sequential', False)),
+            'split': ACTIVE_SPLIT,
             'mode': 'live',
         })
     except Exception as e:
