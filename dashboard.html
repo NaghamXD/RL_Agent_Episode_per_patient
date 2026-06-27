@@ -76,11 +76,18 @@
         .frac-label { font-size:22px; font-weight:700; }
         .frac-sub { font-size:12px; color:var(--muted); }
         .frac-track { display:flex; gap:3px; height:8px; margin-bottom:4px; }
-        .frac-pip { flex:1; border-radius:2px; background:rgba(255,255,255,.08); transition:background .3s; }
+        .frac-pip { flex:1; border-radius:2px; background:rgba(255,255,255,.08); transition:background .3s; cursor:pointer; }
+        .frac-pip:hover { background:rgba(255,255,255,.25); }
         .frac-pip.done { background:var(--primary); }
         .frac-pip.current { background:var(--warning); box-shadow:0 0 6px var(--warning); }
         .frac-progress-label { font-size:10px; color:var(--muted); }
         .metrics-row { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
+        .metrics-row.five { grid-template-columns:repeat(5,1fr); }
+        @media (max-width: 1100px) { .metrics-row.five { grid-template-columns:repeat(3,1fr); } }
+        .frac-jump { width:60px; background:var(--surface2); border:1px solid var(--border); border-radius:8px; color:var(--text); padding:7px 8px; font-size:13px; outline:none; }
+        .frac-jump:focus { border-color:var(--primary); }
+        .toggle-label { margin-left:auto; font-size:11px; color:var(--muted); font-weight:500; display:flex; align-items:center; gap:6px; cursor:pointer; }
+        .toggle-label input { accent-color:var(--primary); cursor:pointer; }
         .metric-card { background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:16px; }
         .metric-card .mc-label { font-size:11px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted); margin-bottom:6px; }
         .metric-card .mc-value { font-size:28px; font-weight:700; line-height:1; }
@@ -120,8 +127,6 @@
         .loading-sub { font-size:12px; color:var(--muted); }
         .error-banner { background:rgba(239,68,68,.1); border:1px solid rgba(239,68,68,.4); border-radius:10px; padding:14px 18px; color:#fca5a5; font-size:13px; display:none; }
         .error-banner.show { display:block; }
-        .reward-chart-wrap { height:140px; position:relative; }
-        .reward-chart-canvas { width:100% !important; height:100% !important; }
         .decomp-wrap { height:150px; position:relative; }
         .decomp-wrap canvas { width:100% !important; height:100% !important; }
         .dvh-wrap { height:320px; position:relative; }
@@ -156,6 +161,11 @@
 <div class="layout">
 
     <aside class="sidebar">
+        <div class="sidebar-section">
+            <h3>Dataset Split</h3>
+            <select id="splitSelect"><option>Loading...</option></select>
+            <div id="splitInfo" style="font-size:11px;color:var(--muted);margin-top:8px"></div>
+        </div>
         <div class="sidebar-section">
             <h3>Patient Selection</h3>
             <div class="patient-select-wrap">
@@ -204,25 +214,27 @@
                 </div>
                 <button class="btn btn-ghost" id="prevBtn">← Prev</button>
                 <button class="btn btn-primary" id="nextBtn">Next →</button>
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <span style="font-size:11px;color:var(--muted)">Jump to</span>
+                    <input class="frac-jump" id="fracJump" type="number" min="1" value="1" title="Type a fraction number and press Enter">
+                </div>
                 <button class="btn btn-ghost" id="summaryBtn">📊 Summary</button>
             </div>
 
-            <div class="metrics-row">
+            <div class="metrics-row five">
                 <div class="metric-card"><div class="mc-label">Total Reward</div><div class="mc-value" id="mReward" style="color:var(--primary)">—</div><div class="mc-sub">this fraction</div></div>
                 <div class="metric-card"><div class="mc-label">PTV Reward</div><div class="mc-value" id="mPTV" style="color:var(--success)">—</div><div class="mc-sub">target coverage</div></div>
                 <div class="metric-card"><div class="mc-label">OAR Penalty</div><div class="mc-value" id="mOAR" style="color:var(--danger)">—</div><div class="mc-sub">dose violation</div></div>
+                <div class="metric-card"><div class="mc-label">Terminal Reward</div><div class="mc-value" id="mTerminal" style="color:#a78bfa">—</div><div class="mc-sub" id="mTerminalSub">final fraction only</div></div>
                 <div class="metric-card"><div class="mc-label">Peak Beamlet</div><div class="mc-value" id="mAction" style="color:var(--warning)">—</div><div class="mc-sub">max action intensity</div></div>
             </div>
 
             <div class="section-card">
-                <div class="section-title">📈 Reward History <span class="tag">All fractions</span></div>
-                <div class="reward-chart-wrap"><canvas id="rewardChart" class="reward-chart-canvas"></canvas></div>
-            </div>
-
-            <div class="section-card">
-                <div class="section-title">⚖️ Reward Components <span class="tag">PTV vs OAR per fraction</span></div>
+                <div class="section-title">⚖️ Reward Components <span class="tag">real per-fraction breakdown</span>
+                    <label class="toggle-label"><input type="checkbox" id="hideTerminal"> Hide terminal reward</label>
+                </div>
                 <div class="decomp-wrap"><canvas id="decompChart"></canvas></div>
-                <div class="chart-note">Per-fraction diagnostics: <span style="color:var(--success)">+λ<sub>ptv</sub>·ptv_reward</span> (up) and <span style="color:var(--danger)">−λ<sub>oar</sub>·oar_penalty</span> (down). The amber outline marks the current fraction.</div>
+                <div class="chart-note" id="decompNote"></div>
             </div>
 
             <div class="section-card">
@@ -266,13 +278,14 @@
 
 <script>
 const API = 'http://localhost:5000/api';
-let config = null, simData = null, fracIdx = 0;
+let config = null, simData = null, fracIdx = 0, activeSplit = null;
 
 const $ = id => document.getElementById(id);
 const patientSelect = $('patientSelect'), randomBtn = $('randomBtn'),
       simulateBtn = $('simulateBtn'), prevBtn = $('prevBtn'),
       nextBtn = $('nextBtn'), summaryBtn = $('summaryBtn'),
-      backToFracBtn = $('backToFracBtn');
+      backToFracBtn = $('backToFracBtn'), splitSelect = $('splitSelect'),
+      fracJump = $('fracJump'), hideTerminal = $('hideTerminal');
 
 const PTV_COLORS = { PTV70:'#4f8ef7', PTV63:'#a78bfa', PTV56:'#34d399' };
 const OAR_ICONS  = { Brainstem:'🧠', SpinalCord:'🦴', Mandible:'🦷', LeftParotid:'💧', RightParotid:'💧' };
@@ -371,7 +384,20 @@ function updateSidebar(fraction) {
 // Fraction pip track
 function buildFracTrack(total) {
     const t = $('fracTrack'); t.innerHTML = '';
-    for (let i=0;i<total;i++) { const p=document.createElement('div'); p.className='frac-pip'; p.id=`pip_${i}`; t.appendChild(p); }
+    for (let i=0;i<total;i++) {
+        const p=document.createElement('div');
+        p.className='frac-pip'; p.id=`pip_${i}`;
+        p.title=`Jump to fraction ${i+1}`;
+        p.addEventListener('click', () => jumpTo(i));
+        t.appendChild(p);
+    }
+}
+// Jump straight to an arbitrary fraction (clamped to range).
+function jumpTo(i) {
+    if (!simData) return;
+    const total = simData.fractions.length;
+    fracIdx = Math.max(0, Math.min(total-1, i));
+    renderFraction();
 }
 function updateFracTrack(idx) {
     document.querySelectorAll('.frac-pip').forEach((p,i) => {
@@ -382,32 +408,27 @@ function updateFracTrack(idx) {
     $('fracProgressLabel').textContent = `${idx+1} of ${simData.fractions.length} fractions`;
 }
 
-// Reward sparkline
-function drawRewardChart() {
-    if (!simData) return;
-    const canvas = $('rewardChart');
-    const W = canvas.offsetWidth, H = canvas.offsetHeight;
-    if (!W || !H) return;
-    canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext('2d');
-    const rewards = simData.fractions.map(f => f.reward || 0);
-    const minR = Math.min(...rewards), maxR = Math.max(...rewards), rng = (maxR-minR)||1;
-    ctx.clearRect(0,0,W,H);
-    ctx.strokeStyle='rgba(255,255,255,0.05)'; ctx.lineWidth=1;
-    for(let i=0;i<=4;i++) { const y=H*(i/4); ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
-    const grad = ctx.createLinearGradient(0,0,0,H);
-    grad.addColorStop(0,'rgba(79,142,247,0.3)'); grad.addColorStop(1,'rgba(79,142,247,0.0)');
-    ctx.fillStyle=grad; ctx.beginPath();
-    rewards.forEach((r,i) => { const x=(i/(rewards.length-1))*W, y=H-((r-minR)/rng)*(H-12)-6; i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
-    ctx.lineTo(W,H); ctx.lineTo(0,H); ctx.closePath(); ctx.fill();
-    ctx.strokeStyle='var(--primary)'; ctx.lineWidth=2; ctx.lineJoin='round'; ctx.beginPath();
-    rewards.forEach((r,i) => { const x=(i/(rewards.length-1))*W, y=H-((r-minR)/rng)*(H-12)-6; i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); });
-    ctx.stroke();
-    const cx=(fracIdx/(rewards.length-1))*W, cy=H-((rewards[fracIdx]-minR)/rng)*(H-12)-6;
-    ctx.fillStyle='var(--warning)'; ctx.beginPath(); ctx.arc(cx,cy,5,0,Math.PI*2); ctx.fill();
+// Reward decomposition — the *real* per-fraction reward components, stacked
+// signed about zero (positive parts up, negative parts down). In sequential
+// mode the components are the exact additive split of the reward:
+//   reward = PTV shaping + OAR shaping + terminal   (terminal: final frac only)
+// In legacy bandit mode they are  +λ·ptv_reward  and  −λ·oar_penalty.
+function decompComponents() {
+    const seq = !!(simData && simData.sequential);
+    const hideTerm = hideTerminal && hideTerminal.checked;
+    if (seq) {
+        const comps = [
+            { label:'PTV shaping', color:'rgba(34,197,94,0.85)',  val:f => f.shaping_ptv || 0 },
+            { label:'OAR shaping', color:'rgba(239,68,68,0.85)',  val:f => f.shaping_oar || 0 },
+        ];
+        if (!hideTerm) comps.push({ label:'Terminal', color:'rgba(167,139,250,0.9)', val:f => f.terminal_reward || 0 });
+        return comps;
+    }
+    return [
+        { label:'+λ·PTV', color:'rgba(34,197,94,0.85)', val:f => (f.lambda_ptv ?? 1) * (f.ptv_reward || 0) },
+        { label:'−λ·OAR', color:'rgba(239,68,68,0.85)', val:f => -(f.lambda_oar ?? 1) * (f.oar_penalty || 0) },
+    ];
 }
-
-// Reward decomposition — PTV contribution (up) vs OAR contribution (down) per fraction.
 function drawRewardDecomp() {
     if (!simData) return;
     const canvas = $('decompChart');
@@ -416,30 +437,53 @@ function drawRewardDecomp() {
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0,0,W,H);
-    const padL=46, padR=12, padT=10, padB=14;
+    const padL=52, padR=12, padT=12, padB=14;
     const plotW=W-padL-padR, plotH=H-padT-padB;
     const fr = simData.fractions;
-    const ptv = fr.map(f => (f.lambda_ptv ?? 1) * (f.ptv_reward || 0));
-    const oar = fr.map(f => -(f.lambda_oar ?? 1) * (f.oar_penalty || 0));
-    const maxV = Math.max(0.001, ...ptv.map(Math.abs), ...oar.map(Math.abs));
-    const half = plotH/2, zY = padT + half;
-    const yv = v => zY - (v/maxV)*half;
+    const comps = decompComponents();
+    // Scale to the largest positive / negative stack across all fractions.
+    let maxStack = 0.001;
+    fr.forEach(f => {
+        let pos=0, neg=0;
+        comps.forEach(c => { const v=c.val(f); if (v>=0) pos+=v; else neg+=-v; });
+        maxStack = Math.max(maxStack, pos, neg);
+    });
+    const half = plotH/2, zY = padT + half, yScale = half/maxStack;
     // zero baseline
     ctx.strokeStyle='rgba(255,255,255,0.18)'; ctx.lineWidth=1;
     ctx.beginPath(); ctx.moveTo(padL,zY); ctx.lineTo(W-padR,zY); ctx.stroke();
     const n=fr.length, gap=plotW/n, bw=Math.max(1.5, gap*0.66);
     fr.forEach((f,i) => {
         const cx = padL + i*gap + (gap-bw)/2;
-        ctx.fillStyle='rgba(34,197,94,0.85)';
-        ctx.fillRect(cx, yv(ptv[i]), bw, zY - yv(ptv[i]));
-        ctx.fillStyle='rgba(239,68,68,0.85)';
-        ctx.fillRect(cx, zY, bw, yv(oar[i]) - zY);
+        let posTop=zY, negBot=zY;
+        comps.forEach(c => {
+            const v=c.val(f), h=Math.abs(v)*yScale;
+            if (h < 0.01) return;
+            ctx.fillStyle=c.color;
+            if (v>=0) { ctx.fillRect(cx, posTop-h, bw, h); posTop-=h; }
+            else      { ctx.fillRect(cx, negBot, bw, h);   negBot+=h; }
+        });
         if (i===fracIdx) { ctx.strokeStyle='#f59e0b'; ctx.lineWidth=1.5; ctx.strokeRect(cx-1, padT, bw+2, plotH); }
     });
     ctx.fillStyle='#8892b0'; ctx.font='10px sans-serif'; ctx.textAlign='right'; ctx.textBaseline='middle';
-    ctx.fillText('+'+maxV.toFixed(2), padL-6, padT+5);
+    ctx.fillText('+'+maxStack.toFixed(2), padL-6, padT+5);
     ctx.fillText('0', padL-6, zY);
-    ctx.fillText('-'+maxV.toFixed(2), padL-6, padT+plotH-5);
+    ctx.fillText('-'+maxStack.toFixed(2), padL-6, padT+plotH-5);
+    // legend / note
+    const seq = !!simData.sequential;
+    const hideTerm = hideTerminal && hideTerminal.checked;
+    const swatch = (col,label) => `<span style="display:inline-flex;align-items:center;gap:5px"><span style="width:11px;height:11px;border-radius:2px;background:${col};display:inline-block"></span>${label}</span>`;
+    let note;
+    if (seq) {
+        note = `Real reward = ${swatch('#22c55e','PTV shaping')} + ${swatch('#ef4444','OAR shaping')}`
+             + (hideTerm ? '' : ` + ${swatch('#a78bfa','terminal')}`)
+             + ` — potential-based shaping γφ(s′)−φ(s) plus the whole-course terminal grade (paid on the final fraction only). These sum exactly to the per-fraction reward. `
+             + (hideTerm ? 'Terminal hidden — dense shaping rescaled to fill the axis.' : 'The terminal bar on Fx 35 is large; tick “Hide terminal reward” to rescale.');
+    } else {
+        note = `Bandit reward = ${swatch('#22c55e','+λ·ptv_reward')} − ${swatch('#ef4444','λ·oar_penalty')} (these sum to the per-fraction reward).`;
+    }
+    note += ' Amber outline marks the current fraction.';
+    $('decompNote').innerHTML = note;
 }
 
 // Dose–Volume Histogram — one cumulative curve per structure.
@@ -516,14 +560,23 @@ function renderFraction() {
     $('fracMode').textContent  = simData.mode==='live' ? 'Live Agent · PPO Deterministic' : 'Demo Mode';
     prevBtn.disabled = fracIdx===0;
     nextBtn.disabled = fracIdx===total-1;
+    fracJump.max = total;
+    fracJump.value = fracIdx+1;
     updateFracTrack(fracIdx);
     $('mReward').textContent = num(f.reward,4);
     $('mPTV').textContent    = num(f.ptv_reward,4);
     $('mOAR').textContent    = num(f.oar_penalty,4);
     $('mAction').textContent = num(f.action_max,3);
+    // Terminal reward is the whole-course grade, paid on the final fraction
+    // only — show a dash on every other fraction so it isn't read as 0 reward.
+    const hasTerminal = Math.abs(f.terminal_reward||0) > 1e-9;
+    $('mTerminal').textContent = hasTerminal ? num(f.terminal_reward,3) : '—';
+    $('mTerminalSub').textContent = hasTerminal
+        ? (f.dvh_score!=null ? `DVH score ${num(f.dvh_score,2)}` : 'end-of-course grade')
+        : 'final fraction only';
     updateSidebar(f);
     renderBeams(f);
-    requestAnimationFrame(() => { drawRewardChart(); drawRewardDecomp(); drawDVH(); });
+    requestAnimationFrame(() => { drawRewardDecomp(); drawDVH(); });
 }
 
 // Summary
@@ -585,21 +638,63 @@ function renderSummary() {
 }
 
 // API
+function fillPatients(ptData) {
+    const pts = ptData.patients || [];
+    patientSelect.innerHTML = pts.map(p=>`<option value="${p}">${p}</option>`).join('');
+    simulateBtn.disabled = pts.length===0;
+    const split = ptData.split || activeSplit || '';
+    $('splitInfo').textContent = `${pts.length} patients${split?` · ${split}`:''} · ${ptData.mode||''}`.trim();
+}
+
+async function loadSplits() {
+    try {
+        const r = await fetch(`${API}/splits`);
+        if(!r.ok) throw new Error();
+        const d = await r.json();
+        const splits = d.splits || [];
+        activeSplit = d.active || splits[0] || null;
+        splitSelect.innerHTML = splits.map(s=>`<option value="${s}" ${s===activeSplit?'selected':''}>${s}</option>`).join('');
+    } catch(e) {
+        // Backend has no split info (older build / demo) — leave a default.
+        splitSelect.innerHTML = '<option value="validation">validation</option>';
+        activeSplit = 'validation';
+    }
+}
+
 async function loadInitialData() {
-    showLoading('Connecting to backend...','Loading config and patient list');
+    showLoading('Connecting to backend...','Loading config, splits and patient list');
     try {
         const [cfgRes, ptRes] = await Promise.all([fetch(`${API}/config`), fetch(`${API}/patients`)]);
         if(!cfgRes.ok) throw new Error(`Config: ${cfgRes.status}`);
         if(!ptRes.ok)  throw new Error(`Patients: ${ptRes.status}`);
         config = await cfgRes.json();
-        const ptData = await ptRes.json();
-        const pts = ptData.patients || [];
-        patientSelect.innerHTML = pts.map(p=>`<option value="${p}">${p}</option>`).join('');
-        simulateBtn.disabled = pts.length===0;
+        await loadSplits();
+        fillPatients(await ptRes.json());
         setStatus(true);
     } catch(e) {
         setStatus(false);
         showError(`Backend unreachable: ${e.message}. Is Flask running on port 5000?`);
+    } finally { hideLoading(); }
+}
+
+async function switchSplit() {
+    const split = splitSelect.value;
+    if (split === activeSplit) return;
+    showLoading('Switching dataset...', `Loading the ${split} split`);
+    try {
+        const r = await fetch(`${API}/split`, {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({split}),
+        });
+        if(!r.ok) { const b=await r.json().catch(()=>({})); throw new Error(b.error||`HTTP ${r.status}`); }
+        const d = await r.json();
+        activeSplit = d.split || split;
+        fillPatients(d);
+        // The patient pool changed — drop any stale simulation and reset.
+        simData = null; showWelcome();
+    } catch(e) {
+        showError(`Could not switch dataset: ${e.message}`);
+        splitSelect.value = activeSplit;   // revert the dropdown
     } finally { hideLoading(); }
 }
 
@@ -612,6 +707,7 @@ async function runSimulation() {
         if(!res.ok) { const b=await res.json().catch(()=>({})); throw new Error(b.error||`HTTP ${res.status}`); }
         simData = await res.json();
         if(!simData.fractions||!simData.fractions.length) throw new Error('No fraction data returned');
+        simData.sequential = !!simData.sequential;
         simData.fractions = simData.fractions.map(f=>({
             fraction:               f.fraction               ?? 0,
             reward:                 typeof f.reward          ==='number'?f.reward:0,
@@ -624,6 +720,10 @@ async function runSimulation() {
             ptv_d95:                f.ptv_d95                ||{},
             lambda_oar:             typeof f.lambda_oar      ==='number'?f.lambda_oar:1,
             lambda_ptv:             typeof f.lambda_ptv      ==='number'?f.lambda_ptv:1,
+            shaping_ptv:            typeof f.shaping_ptv     ==='number'?f.shaping_ptv:0,
+            shaping_oar:            typeof f.shaping_oar     ==='number'?f.shaping_oar:0,
+            terminal_reward:        typeof f.terminal_reward ==='number'?f.terminal_reward:0,
+            dvh_score:              typeof f.dvh_score       ==='number'?f.dvh_score:null,
         }));
         fracIdx = 0;
         buildFracTrack(simData.fractions.length);
@@ -639,9 +739,13 @@ randomBtn.addEventListener('click', async()=>{ try { const r=await fetch(`${API}
 simulateBtn.addEventListener('click', runSimulation);
 prevBtn.addEventListener('click', ()=>{ if(fracIdx>0){fracIdx--;renderFraction();} });
 nextBtn.addEventListener('click', ()=>{ if(simData&&fracIdx<simData.fractions.length-1){fracIdx++;renderFraction();} });
+splitSelect.addEventListener('change', switchSplit);
+fracJump.addEventListener('change', ()=>jumpTo((parseInt(fracJump.value,10)||1)-1));
+fracJump.addEventListener('keydown', e=>{ if(e.key==='Enter') jumpTo((parseInt(fracJump.value,10)||1)-1); });
+hideTerminal.addEventListener('change', ()=>{ if(simData) drawRewardDecomp(); });
 summaryBtn.addEventListener('click', renderSummary);
 backToFracBtn.addEventListener('click', ()=>{ showSimView(); renderFraction(); });
-window.addEventListener('resize', ()=>{ if(simData){ drawRewardChart(); drawRewardDecomp(); drawDVH(); } });
+window.addEventListener('resize', ()=>{ if(simData){ drawRewardDecomp(); drawDVH(); } });
 
 loadInitialData();
 </script>

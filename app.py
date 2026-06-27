@@ -48,6 +48,9 @@ EVAL_RESULTS = {}
 # present in the runs folder on every request (see _sync_agent_with_disk).
 CKPT_PATH = None
 CKPT_MTIME = None
+# The processed-data split (train / validation / test) the env is currently
+# bound to. The UI can switch this at runtime via POST /api/split.
+ACTIVE_SPLIT = None
 
 
 def _load_agent(ckpt_path):
@@ -111,8 +114,9 @@ def init_backend(config_path: str = "configs/default.yaml",
                  ckpt_path: str = "runs/best.pt",
                  split: str = "validation"):
     """Initialize backend with config, environment, and agent."""
-    global CONFIG, ENV, AGENT, BACKEND_READY, CKPT_PATH
+    global CONFIG, ENV, AGENT, BACKEND_READY, CKPT_PATH, ACTIVE_SPLIT
 
+    ACTIVE_SPLIT = split
     try:
         if not MODELS_AVAILABLE:
             print("ERROR: RL models not available, using demo mode")
@@ -227,6 +231,86 @@ def get_patients():
             'mode': 'demo',
             'error': str(e)
         })
+
+
+_DEFAULT_SPLITS = ["train", "validation", "test"]
+
+
+def _available_splits():
+    """Processed-data splits present on disk (subfolders that hold patients).
+
+    Falls back to the conventional ``train/validation/test`` names when the
+    real config / processed dir isn't available (e.g. demo mode), so the UI
+    always has something to offer.
+    """
+    if CONFIG is None or not MODELS_AVAILABLE:
+        return list(_DEFAULT_SPLITS)
+    try:
+        processed_dir = Path(CONFIG.processed_dir)
+    except Exception:
+        return list(_DEFAULT_SPLITS)
+    if not processed_dir.is_dir():
+        return list(_DEFAULT_SPLITS)
+    splits = []
+    for child in sorted(processed_dir.iterdir()):
+        # A split folder is a directory that itself contains patient folders.
+        if child.is_dir() and any(p.is_dir() for p in child.iterdir()):
+            splits.append(child.name)
+    return splits or list(_DEFAULT_SPLITS)
+
+
+@app.route('/api/splits', methods=['GET'])
+def get_splits():
+    """List the available dataset splits and which one is active."""
+    return jsonify({
+        'splits': _available_splits(),
+        'active': ACTIVE_SPLIT,
+    })
+
+
+@app.route('/api/split', methods=['POST'])
+def set_split():
+    """Switch the active dataset split (train / validation / test).
+
+    Rebuilds ENV against the requested split's patient folder and returns the
+    new patient list so the UI can repopulate its dropdown. The agent and
+    config are untouched — only the pool of patients the env draws from.
+    """
+    global ENV, ACTIVE_SPLIT, PATIENT_CACHE
+    data = request.get_json(silent=True) or {}
+    split = data.get('split')
+    available = _available_splits()
+    if split not in available:
+        return jsonify({
+            'error': f"Unknown split '{split}'. Available: {available}",
+        }), 400
+
+    if not (MODELS_AVAILABLE and CONFIG is not None):
+        # Demo mode: no real env to rebuild, just remember the choice.
+        ACTIVE_SPLIT = split
+        demo_patients = [f"pt_{200+i}" for i in range(20)]
+        return jsonify({
+            'split': split,
+            'patients': demo_patients,
+            'total_count': len(demo_patients),
+            'mode': 'demo',
+        })
+
+    try:
+        ENV = DoseEnv(CONFIG, split=split)
+        ACTIVE_SPLIT = split
+        PATIENT_CACHE = {}
+        patients = sorted(ENV.patient_ids)
+        return jsonify({
+            'split': split,
+            'patients': patients,
+            'total_count': len(patients),
+            'mode': 'live',
+        })
+    except Exception as e:
+        print(f"Error switching split to '{split}': {e}")
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 400
 
 
 @app.route('/api/patients/<patient_id>/data', methods=['GET'])
@@ -459,7 +543,16 @@ def simulate_patient(patient_id):
                     'ptv_d95': ptv_d95_frac,
                     'lambda_oar': lambda_oar,
                     'lambda_ptv': lambda_ptv,
+                    # Synthetic reward decomposition for demo mode (labelled as
+                    # demo in the UI). terminal is filled in on the last frac.
+                    'shaping_ptv': float(lambda_ptv * (0.02 + 0.001 * i)),
+                    'shaping_oar': float(-lambda_oar * max(0, 0.08 - i * 0.001)),
+                    'terminal_reward': 0.0,
+                    'dvh_score': None,
                 })
+            # The whole-course grade lands on the final fraction only.
+            fraction_data[-1]['terminal_reward'] = float(lambda_ptv * 0.9 - 0.25)
+            fraction_data[-1]['dvh_score'] = 26.0
             # Demo mode: all structures are synthetic and therefore present.
             present_structures = None
             dvh = _dvh_demo(fraction_data[-1]['cumulative_organ_doses'],
@@ -477,6 +570,8 @@ def simulate_patient(patient_id):
                     present_structures,
                     list(prescriptions.keys()), list(tolerances.keys()),
                 ),
+                'sequential': True,
+                'split': ACTIVE_SPLIT,
                 'mode': 'demo',
             })
 
@@ -537,6 +632,14 @@ def simulate_patient(patient_id):
                 'ptv_d95': dict(fraction_ptv_d95),
                 'lambda_oar': float(info.get('lambda_oar', lambda_oar)),
                 'lambda_ptv': float(info.get('lambda_ptv', lambda_ptv)),
+                # Real reward decomposition (sequential mode). shaping_ptv +
+                # shaping_oar + terminal_reward == reward exactly. terminal is
+                # 0 except on the final fraction; dvh_score only set there.
+                'shaping_ptv': float(info.get('shaping_ptv', 0.0)),
+                'shaping_oar': float(info.get('shaping_oar', 0.0)),
+                'terminal_reward': float(info.get('terminal_reward', 0.0)),
+                'dvh_score': (float(info['dvh_score'])
+                              if info.get('dvh_score') is not None else None),
             })
             fraction_idx += 1
 
@@ -560,6 +663,8 @@ def simulate_patient(patient_id):
                 present_structures,
                 list(prescriptions.keys()), list(tolerances.keys()),
             ),
+            'sequential': bool(getattr(CONFIG, 'sequential', False)),
+            'split': ACTIVE_SPLIT,
             'mode': 'live',
         })
     except Exception as e:

@@ -237,26 +237,43 @@ class DoseEnv:
             # gap-closing and OAR-budget keeping every fraction; the real
             # whole-course objective is paid out only at patient_done so the
             # value function must carry it backward (gamma does real work).
+            #
+            # phi = -lambda_phi * ptv_term - lambda_oar * oar_term, so the
+            # shaping reward gamma*phi(s') - phi(s) splits *exactly* and
+            # additively into a PTV part and an OAR part. We evaluate the four
+            # potential terms once here (rather than calling sequential_potential
+            # twice) so the per-fraction shaping components can be exposed in
+            # ``info`` for diagnostics / the UI without changing the reward.
             oar_masks = self._oar_masks()
-            phi_before = reward_module.sequential_potential(
-                cumulative_dose_before, prescription_volume, oar_masks,
-                self.cfg.oar_tolerance,
-                lambda_phi=self.lambda_phi, lambda_oar=self.lambda_oar,
-                organ_weights=self.cfg.oar_weights,
-                ptv_gap_power=getattr(self.cfg, "ptv_gap_power", 1.0),
-                oar_barrier_steepness=getattr(
-                    self.cfg, "oar_barrier_steepness", None),
-            )
-            phi_after = reward_module.sequential_potential(
-                self.cumulative_dose, prescription_volume, oar_masks,
-                self.cfg.oar_tolerance,
-                lambda_phi=self.lambda_phi, lambda_oar=self.lambda_oar,
-                organ_weights=self.cfg.oar_weights,
-                ptv_gap_power=getattr(self.cfg, "ptv_gap_power", 1.0),
-                oar_barrier_steepness=getattr(
-                    self.cfg, "oar_barrier_steepness", None),
-            )
+            ptv_gap_power = getattr(self.cfg, "ptv_gap_power", 1.0)
+            oar_barrier_steepness = getattr(
+                self.cfg, "oar_barrier_steepness", None)
+            ptv_term_before = reward_module.ptv_gap_fraction(
+                cumulative_dose_before, prescription_volume,
+                power=ptv_gap_power)
+            ptv_term_after = reward_module.ptv_gap_fraction(
+                self.cumulative_dose, prescription_volume,
+                power=ptv_gap_power)
+            oar_term_before = reward_module.oar_overshoot_fraction(
+                cumulative_dose_before, oar_masks, self.cfg.oar_tolerance,
+                self.cfg.oar_weights, steepness=oar_barrier_steepness)
+            oar_term_after = reward_module.oar_overshoot_fraction(
+                self.cumulative_dose, oar_masks, self.cfg.oar_tolerance,
+                self.cfg.oar_weights, steepness=oar_barrier_steepness)
+            phi_before = (-self.lambda_phi * ptv_term_before
+                          - self.lambda_oar * oar_term_before)
+            phi_after = (-self.lambda_phi * ptv_term_after
+                         - self.lambda_oar * oar_term_after)
             reward = self.gamma * phi_after - phi_before
+            # Exact additive split of the dense shaping reward (these two sum
+            # to gamma*phi_after - phi_before).
+            info["shaping_ptv"] = float(
+                -self.lambda_phi * (self.gamma * ptv_term_after
+                                    - ptv_term_before))
+            info["shaping_oar"] = float(
+                -self.lambda_oar * (self.gamma * oar_term_after
+                                    - oar_term_before))
+            info["terminal_reward"] = 0.0
             if patient_done:
                 dvh = dvh_score(
                     self.cumulative_dose, self._data["dose_gt"],
