@@ -43,14 +43,76 @@ AGENT = None
 BACKEND_READY = False
 PATIENT_CACHE = {}
 EVAL_RESULTS = {}
+# Path to the checkpoint the agent is loaded from, plus the file mtime it was
+# loaded at. These let us reconcile the in-memory agent with the file actually
+# present in the runs folder on every request (see _sync_agent_with_disk).
+CKPT_PATH = None
+CKPT_MTIME = None
+
+
+def _load_agent(ckpt_path):
+    """Load the PPO agent from a checkpoint file on disk.
+
+    Sets the module-level AGENT and records the file's mtime. When the file is
+    absent (or the models/torch are unavailable), AGENT is set to None so the
+    rest of the app falls back to the explicit "agent-unavailable" refusal
+    instead of serving a stale, in-memory model.
+    """
+    global AGENT, CKPT_MTIME
+    path = Path(ckpt_path)
+    if not (MODELS_AVAILABLE and TORCH_AVAILABLE and CONFIG is not None):
+        AGENT, CKPT_MTIME = None, None
+        return None
+    if not path.exists():
+        AGENT, CKPT_MTIME = None, None
+        return None
+    from src.config import resolve_device
+    device = resolve_device(CONFIG.device)
+    # in_channels = CT(1) + structures(3+5) + cumulative_dose(1) + ptv_gap(1) + beam_paths(1) = 12
+    in_channels = 12
+    agent = PPO(CONFIG, in_channels=in_channels)
+    checkpoint = torch.load(str(path), map_location=device)
+    agent.net.load_state_dict(checkpoint['net'])
+    agent.net.eval()
+    AGENT = agent
+    CKPT_MTIME = path.stat().st_mtime
+    return agent
+
+
+def _sync_agent_with_disk():
+    """Re-bind AGENT to whatever checkpoint is in the runs folder *right now*.
+
+    The Flask process keeps the agent in memory for its whole lifetime, so a
+    checkpoint deleted or retrained after startup would otherwise be ignored.
+    Called on every simulation request: drop the agent if its file is gone,
+    reload it if the file changed on disk. This guarantees the UI only ever
+    reflects the current contents of the runs folder, never a stale RAM copy.
+    """
+    global AGENT, CKPT_MTIME
+    if CKPT_PATH is None or CONFIG is None:
+        return
+    path = Path(CKPT_PATH)
+    if not path.exists():
+        if AGENT is not None:
+            print(f"Checkpoint '{CKPT_PATH}' is gone from disk; dropping in-memory agent.")
+            AGENT, CKPT_MTIME = None, None
+        return
+    mtime = path.stat().st_mtime
+    if AGENT is None or mtime != CKPT_MTIME:
+        try:
+            print(f"(Re)loading agent from '{CKPT_PATH}' (new or changed on disk).")
+            _load_agent(CKPT_PATH)
+        except Exception as e:
+            print(f"Failed to (re)load agent from '{CKPT_PATH}': {e}")
+            AGENT, CKPT_MTIME = None, None
 
 
 def init_backend(config_path: str = "configs/default.yaml", 
                  ckpt_path: str = "runs/best.pt",
                  split: str = "validation"):
     """Initialize backend with config, environment, and agent."""
-    global CONFIG, ENV, AGENT, BACKEND_READY
-    
+    global CONFIG, ENV, AGENT, BACKEND_READY, CKPT_PATH
+
     try:
         if not MODELS_AVAILABLE:
             print("ERROR: RL models not available, using demo mode")
@@ -70,21 +132,20 @@ def init_backend(config_path: str = "configs/default.yaml",
         
         CONFIG = load_config(config_path)
         ENV = DoseEnv(CONFIG, split=split)
-        
-        # Load pretrained agent
-        # PPO.__init__ takes (cfg, in_channels)
-        # in_channels = CT(1) + structures(3+5) + cumulative_dose(1) + ptv_gap(1) + beam_paths(1) = 12
-        in_channels = 12
-        AGENT = PPO(CONFIG, in_channels=in_channels)
-        
-        from src.config import resolve_device
-        device = resolve_device(CONFIG.device)
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        AGENT.net.load_state_dict(checkpoint['net'])
-        AGENT.net.eval()
-        
+        CKPT_PATH = ckpt_path
+
+        # Load the trained agent from disk. A missing checkpoint is handled
+        # gracefully (AGENT stays None) rather than raising, so the backend
+        # comes up in a well-defined "agent-unavailable" state. The agent is
+        # re-reconciled with the runs folder on every request afterwards.
+        _load_agent(ckpt_path)
+
         BACKEND_READY = True
-        print("✓ Backend initialized successfully")
+        if AGENT is not None:
+            print("✓ Backend initialized successfully")
+        else:
+            print(f"⚠ Backend ready, but no usable checkpoint at '{ckpt_path}'. "
+                  "Agent unavailable until a checkpoint is present in the runs folder.")
         return CONFIG, ENV, AGENT
     except Exception as e:
         print(f"ERROR initializing backend: {e}")
@@ -96,11 +157,17 @@ def init_backend(config_path: str = "configs/default.yaml",
 @app.route('/api/health', methods=['GET'])
 def health():
     """Health check endpoint."""
+    # Reconcile with disk so the reported agent state is the truth right now,
+    # not whatever was loaded at startup.
+    _sync_agent_with_disk()
     return jsonify({
-        'status': 'ok', 
+        'status': 'ok',
         'timestamp': datetime.now().isoformat(),
         'backend_ready': BACKEND_READY,
-        'models_available': MODELS_AVAILABLE
+        'models_available': MODELS_AVAILABLE,
+        'agent_loaded': AGENT is not None,
+        'checkpoint_path': CKPT_PATH,
+        'checkpoint_present': bool(CKPT_PATH and Path(CKPT_PATH).exists()),
     })
 
 
@@ -338,6 +405,12 @@ def _dvh_demo(cumulative_organ_doses, prescriptions,
 def simulate_patient(patient_id):
     """Run agent simulation on a patient for all fractions."""
     try:
+        # Reconcile the agent with the checkpoint on disk *before* simulating,
+        # so we never serve a model that has since been removed from or replaced
+        # in the runs folder. If the file is gone, AGENT becomes None and the
+        # live path below refuses with a 503 rather than using a stale RAM copy.
+        _sync_agent_with_disk()
+
         prescriptions = CONFIG.prescription if CONFIG else {"PTV70": 70.0, "PTV63": 63.0, "PTV56": 56.0}
         tolerances = CONFIG.oar_tolerance if CONFIG else {
             "Brainstem": 54.0, "SpinalCord": 45.0, "Mandible": 70.0,

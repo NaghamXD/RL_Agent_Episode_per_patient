@@ -112,7 +112,7 @@ minibatch:       64
 # Tier-3: 3500 episodes (with 200 train patients each visited ~17 times via
 # random sampling) so the 600-episode OAR curriculum completes and PPO has
 # ample episodes at full lambda_oar to refine the warm-start plan.
-total_episodes:  3500
+total_episodes:  1000
 eval_every:      50
 seed:            42
 # "auto" picks cuda > mps > cpu, but is pinned to "cpu" here: on this
