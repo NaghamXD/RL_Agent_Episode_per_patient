@@ -84,6 +84,11 @@ class DoseEnv:
         )
         self.gamma: float = float(getattr(cfg, "gamma", 0.99))
 
+        # State-channel ablation toggle (see Config.include_beam_paths).
+        self.include_beam_paths: bool = bool(
+            getattr(cfg, "include_beam_paths", True)
+        )
+
     # ------------------------------------------------------------------ utils
     def _structure_masks(self) -> Dict[str, np.ndarray]:
         """``{structure_name: (G, G, G) binary mask}`` for all loaded structures."""
@@ -238,12 +243,18 @@ class DoseEnv:
                 self.cfg.oar_tolerance,
                 lambda_phi=self.lambda_phi, lambda_oar=self.lambda_oar,
                 organ_weights=self.cfg.oar_weights,
+                ptv_gap_power=getattr(self.cfg, "ptv_gap_power", 1.0),
+                oar_barrier_steepness=getattr(
+                    self.cfg, "oar_barrier_steepness", None),
             )
             phi_after = reward_module.sequential_potential(
                 self.cumulative_dose, prescription_volume, oar_masks,
                 self.cfg.oar_tolerance,
                 lambda_phi=self.lambda_phi, lambda_oar=self.lambda_oar,
                 organ_weights=self.cfg.oar_weights,
+                ptv_gap_power=getattr(self.cfg, "ptv_gap_power", 1.0),
+                oar_barrier_steepness=getattr(
+                    self.cfg, "oar_barrier_steepness", None),
             )
             reward = self.gamma * phi_after - phi_before
             if patient_done:
@@ -256,6 +267,8 @@ class DoseEnv:
                     self.cfg.prescription, dvh,
                     lambda_ptv=self.lambda_ptv,
                     terminal_dvh_weight=self.terminal_dvh_weight,
+                    use_soft_coverage=getattr(
+                        self.cfg, "terminal_use_soft_coverage", False),
                 )
                 reward += terminal
                 info["terminal_reward"] = float(terminal)
@@ -282,7 +295,7 @@ class DoseEnv:
         ch S+1     : cumulative_dose / 70
         ch S+2     : per-voxel dose gap (prescription - cumulative_dose),
                      clipped >= 0, /70
-        ch S+3     : beam paths
+        ch S+3     : beam paths (only if cfg.include_beam_paths)
         """
         ct = self._data["ct"][None]                                     # (1,G,G,G)
         structure_masks = self._data["masks"]                            # (S,G,G,G)
@@ -292,10 +305,9 @@ class DoseEnv:
                     0.0, None)[None]
             / 70.0
         )
-        beam_paths = self._data["beam_paths"][None]
-        state = np.concatenate(
-            [ct, structure_masks, cumulative_dose_channel,
-             ptv_dose_gap_channel, beam_paths],
-            axis=0,
-        )
+        channels = [ct, structure_masks, cumulative_dose_channel,
+                   ptv_dose_gap_channel]
+        if self.include_beam_paths:
+            channels.append(self._data["beam_paths"][None])
+        state = np.concatenate(channels, axis=0)
         return state.astype(np.float32)

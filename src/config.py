@@ -5,7 +5,7 @@ Defaults mirror configs/default.yaml; YAML overrides apply at runtime.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 import yaml
 import torch
 
@@ -32,6 +32,15 @@ class Config:
     n_beams: int = 9
     beamlet_h: int = 16
     beamlet_w: int = 16
+
+    # Include the precomputed per-patient beam-path channel (1 of 12) in the
+    # state tensor. False drops it -> in_channels becomes 11. in_channels is
+    # inferred at runtime from _build_state's actual output shape (see
+    # train.py/evaluate.py: `in_channels = initial_state.shape[0]`), so this
+    # flag alone is sufficient to resize the network -- no other code change
+    # needed. Checkpoints are NOT compatible across different values of this
+    # flag (different in_channels -> different first Conv3d shape).
+    include_beam_paths: bool = True
 
     prescription: Dict[str, float] = field(default_factory=lambda: {
         "PTV70": 70.0, "PTV63": 63.0, "PTV56": 56.0,
@@ -82,6 +91,17 @@ class Config:
     # Weight on the (negative) DVH score inside the terminal reward. The
     # terminal reward = lambda_ptv*coverage - terminal_dvh_weight*dvh_score.
     terminal_dvh_weight: float = 0.1
+    # --- reward-shaping ablation (see src/env/reward.py) ---
+    # All three default to the old (pre-improvement) behaviour; see
+    # scripts/sweep_reward_shaping.py for the actual A/B/C comparison.
+    # Improvement A: ptv_gap_fraction's power (1.0=old linear, 2.0=quadratic).
+    ptv_gap_power: float = 1.0
+    # Improvement B: oar_overshoot_fraction's soft-barrier steepness
+    # (None=old hard threshold; a float enables the soft barrier).
+    oar_barrier_steepness: Optional[float] = None
+    # Improvement C: use soft_coverage (differentiable) instead of the hard
+    # coverage() step inside terminal_reward.
+    terminal_use_soft_coverage: bool = False
     # Number of patient trajectories collected per PPO update in sequential
     # mode (advantages are normalised across the whole batch).
     batch_n_patients: int = 8

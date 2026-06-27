@@ -428,11 +428,12 @@ def main():
     # it opens in append mode) so a gamma sweep or a plateau check has
     # something to compare. See src/utils/train_logger.py.
     logger = TrainingLogger(Path(cfg.ckpt_dir) / "train_log.csv")
-    # Diagnostic-only: logs a "[plateau]" message but never stops training
-    # (see src/utils/early_stopping.py for the rationale). Disabled by
-    # default (early_stop_patience_evals: 0); patience only starts counting
-    # once the OAR-weight curriculum has fully ramped, so the curriculum's
-    # own transient dip isn't misread as a plateau.
+    # Stops training once val_dvh plateaus (see src/utils/early_stopping.py
+    # for the rationale and a concrete motivating case). Disabled by default
+    # (early_stop_patience_evals: 0); patience only starts counting once the
+    # OAR-weight curriculum has fully ramped, so the curriculum's own
+    # transient dip isn't misread as a plateau. best.pt is unaffected
+    # either way -- it's saved independently whenever val_dvh improves.
     plateau_monitor = PlateauMonitor(
         patience_evals=int(getattr(cfg, "early_stop_patience_evals", 0)),
         min_delta=float(getattr(cfg, "early_stop_min_delta", 0.005)),
@@ -440,6 +441,7 @@ def main():
     )
 
     end_episode = start_episode + cfg.total_episodes
+    early_stopped = False
     progress_bar = trange(start_episode, end_episode, desc="train")
     for episode_index in progress_bar:
         # OAR-weight curriculum: ramp lambda_oar over the first
@@ -515,13 +517,14 @@ def main():
                 )
             if np.isfinite(val_dvh) and plateau_monitor.update(episode_index, val_dvh):
                 tqdm.write(
-                    f"  [plateau] no >{plateau_monitor.min_delta * 100:.1f}% "
+                    f"  [early-stop] no >{plateau_monitor.min_delta * 100:.1f}% "
                     f"relative improvement in val_dvh for "
                     f"{plateau_monitor.patience_evals} validation check(s) "
                     f"(best so far: {plateau_monitor.best_score:.3f}) "
-                    f"at episode {episode_index + 1} -- monitor only, "
-                    f"training continues."
+                    f"at episode {episode_index + 1} -- stopping training. "
+                    f"best.pt already reflects the best checkpoint seen."
                 )
+                early_stopped = True
 
         # Fallback rolling-mean criterion only when no validation env.
         if val_env is None and len(recent_patient_rewards) >= recent_patient_rewards.maxlen:
@@ -549,9 +552,14 @@ def main():
             is_new_best=is_new_best_this_episode,
         )
 
+        if early_stopped:
+            break
+
     # Always keep a final checkpoint, even if total_episodes is not a
-    # multiple of eval_every.
-    last_episode_index = end_episode - 1
+    # multiple of eval_every. ``episode_index`` is the loop variable's
+    # last value, so this is correct whether the run finished naturally
+    # or stopped early via ``early_stopped``.
+    last_episode_index = episode_index
     agent.save(os.path.join(cfg.ckpt_dir, "last.pt"),
               episode_index=last_episode_index, best_val_dvh=best_val_dvh)
 

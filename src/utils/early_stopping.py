@@ -1,12 +1,20 @@
 """Validation-plateau monitor for ``train.py``.
 
-Diagnostic by design: it flags a plateau (logs it) but never stops
-training itself. PPO on this task can have a transient plateau during the
-OAR-weight curriculum ramp before a later breakthrough at full
-``lambda_oar``, so auto-stopping on the first sign of stalling risks
-cutting a run short prematurely. Patience only starts counting once the
-curriculum has fully ramped (``start_episode``), since the ramp's own
-transient dip would otherwise look like a plateau.
+``update()`` just detects a plateau (returns ``True`` once, on the check
+where it's first flagged) -- ``train.py`` is what acts on that signal and
+breaks the training loop. Disabled by default
+(``early_stop_patience_evals: 0``).
+
+PPO on this task can have a transient plateau during the OAR-weight
+curriculum ramp before a later breakthrough at full ``lambda_oar``, so
+patience only starts counting once the curriculum has fully ramped
+(``start_episode``) -- otherwise the ramp's own transient dip would look
+like a plateau and stop training before it really gets going. Concrete
+motivating case: a 3500-episode MPS run peaked (best val_dvh) at episode
+174, then -- with nothing to stop it -- ran all the way to 3500 while the
+policy collapsed to a val_dvh roughly 5x worse (entropy/log_std ran away
+unchecked). ``best.pt`` was never at risk (it's saved independently
+whenever val_dvh improves), but ~3300 episodes of compute were wasted.
 """
 from __future__ import annotations
 

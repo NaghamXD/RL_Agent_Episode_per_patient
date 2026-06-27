@@ -77,6 +77,13 @@ terminal_dvh_weight:  0.1
 # Patient trajectories collected per PPO update (advantages normalised across).
 batch_n_patients:     8
 
+# --- reward-shaping ablation (see src/env/reward.py module docstring and
+# scripts/sweep_reward_shaping.py) -- all 3 default to old behaviour here;
+# this default.yaml is not where the comparison happens.
+ptv_gap_power:              1.0    # A: 1.0=old linear, 2.0=quadratic
+oar_barrier_steepness:      null   # B: null=old hard threshold, e.g. 2.0=soft barrier
+terminal_use_soft_coverage: false  # C: false=old hard step, true=sigmoid
+
 # --- actor exploration (log-std) ---
 # The actor mu is warm-started onto the static FISTA-NNLS plan. Start the
 # global, state-independent log-std HIGH so PPO actively deviates from that
@@ -116,6 +123,22 @@ seed:            42
 # 7+ trials and independent of the (separately real, separately fixed)
 # inplace=True ReLU bug. CPU is fully stable under identical math, just
 # slower. Re-test before switching back to "mps"/"auto" on this box.
+#
+# Already tried and verified NOT sufficient: gating in nn.GroupNorm(8, C)
+# after each Conv3d only on the MPS path (CPU/CUDA untouched). Re-ran
+# PPO.pretrain_actor with real cached warm-start data and proper seeding
+# (torch.manual_seed + np.random.seed, matching train.py) across multiple
+# seeds -- still NaNs (or Infs) within 1-2 epochs every time. Also
+# observed genuine run-to-run nondeterminism in MPS kernel execution
+# itself (identical seeds + verified-identical weights + identical input
+# data still produced slightly different loss trajectories across
+# separate process runs), consistent with non-deterministic float
+# reduction order in MPS Conv3d/GroupNorm backward kernels. Don't
+# re-attempt a GroupNorm-only fix; if revisiting, a stronger
+# intervention (e.g. lower init gain on MPS, NaN-guarded optimizer step,
+# or normalizing the actor/critic Linear trunks too) would be needed,
+# verified the same way (multiple seeds, real warm-start data, not
+# synthetic data with unseeded numpy shuffling).
 device:          cpu
 ckpt_dir:        runs
 
@@ -159,3 +182,15 @@ lambda_oar_ramp_start_factor: 0.10
 best_n_val_patients: 40
 best_eval_every:     25
 best_rolling_window: 10
+
+# --- early stopping ---
+# Stops training once val_dvh goes >early_stop_patience_evals checks
+# without a >early_stop_min_delta relative improvement (after the OAR
+# curriculum has fully ramped -- see src/utils/early_stopping.py). 8 evals
+# at best_eval_every=25 is ~200 episodes of patience post-ramp. Motivating
+# case: a 3500-episode MPS run peaked at episode 174 then ran all the way
+# to 3500 while the policy collapsed to ~5x worse with nothing to stop it;
+# patience=8 would have caught it at episode 399. best.pt is unaffected
+# either way since it's saved independently whenever val_dvh improves.
+early_stop_patience_evals: 8
+early_stop_min_delta:      0.005

@@ -34,11 +34,18 @@ def plot_training_curve(log_path: Path, out_path: Path) -> Path:
     axes[0].legend(loc="best")
     axes[0].set_title(f"training curve -- {log_path}")
 
-    axes[1].plot(df["episode"], df["policy_loss"], label="policy loss")
-    axes[1].plot(df["episode"], df["value_loss"], label="value loss")
-    axes[1].plot(df["episode"], df["entropy"], label="entropy")
-    axes[1].set_ylabel("PPO losses / entropy")
-    axes[1].legend(loc="best")
+    # entropy is summed over all action dimensions (thousands of beamlets),
+    # so it's orders of magnitude larger than the losses -- give it its own
+    # axis rather than letting it flatten policy/value loss to a line at 0.
+    loss_lines = axes[1].plot(df["episode"], df["policy_loss"], label="policy loss", color="tab:blue")
+    loss_lines += axes[1].plot(df["episode"], df["value_loss"], label="value loss", color="tab:orange")
+    axes[1].set_ylabel("PPO losses (per-update mean)")
+
+    entropy_axis = axes[1].twinx()
+    entropy_lines = entropy_axis.plot(df["episode"], df["entropy"], label="entropy", color="tab:green")
+    entropy_axis.set_ylabel("policy entropy (summed over action dims)")
+
+    axes[1].legend(loss_lines + entropy_lines, [line.get_label() for line in loss_lines + entropy_lines], loc="best")
 
     if len(val_df):
         axes[2].plot(val_df["episode"], val_df["val_dvh"], "o-",
